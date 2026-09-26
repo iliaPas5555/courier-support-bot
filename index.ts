@@ -32,12 +32,7 @@ function header(from: any): string {
 
 const CAPTION_TYPES = ["photo", "video", "document", "audio", "voice", "animation"];
 
-const WELCOME =
-  "Привет! Это поддержка курьеров 👋\n\n" +
-  "Напиши сюда свою проблему: ФИО, номер телефона и что случилось " +
-  "(не пришла оплата, сгорело задание, проблема с личным кабинетом и т.д.). " +
-  "Можно прикрепить скриншот или фото.\n\n" +
-  "Ответ придёт сюда же, в этот чат.";
+const WELCOME = "Напишите свое ФИО, номер телефона и описание проблемы";
 
 async function handleCourier(msg: any) {
   const chatId = msg.chat.id;
