@@ -39,6 +39,16 @@ const WELCOME =
   "Можно прикрепить скриншот или фото.\n\n" +
   "Ответ придёт сюда же, в этот чат.";
 
+const OFF_HOURS_TEXT =
+  "🌙 Поддержка работает с 9:00 до 22:00 по МСК.\n" +
+  "Твоё сообщение мы получили и ответим утром.";
+const offHoursNotified = new Map<number, number>();
+
+function isOffHours(): boolean {
+  const mskHour = (new Date().getUTCHours() + 3) % 24; // МСК = UTC+3
+  return mskHour >= 22 || mskHour < 9;
+}
+
 async function handleCourier(msg: any) {
   const chatId = msg.chat.id;
   const from = msg.from;
@@ -106,6 +116,13 @@ async function handleCourier(msg: any) {
       message_id: msg.message_id,
       reaction: [{ type: "emoji", emoji: "👍" }],
     });
+    if (isOffHours()) {
+      const last = offHoursNotified.get(from.id) ?? 0;
+      if (Date.now() - last > 3 * 60 * 60 * 1000) {
+        offHoursNotified.set(from.id, Date.now());
+        await tg("sendMessage", { chat_id: chatId, text: OFF_HOURS_TEXT });
+      }
+    }
   } else {
     await tg("sendMessage", { chat_id: chatId, text: "Не получилось отправить сообщение, попробуй ещё раз 🙏" });
   }
