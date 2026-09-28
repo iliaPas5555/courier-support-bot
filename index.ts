@@ -1,12 +1,16 @@
-// Бот поддержки курьеров: курьер пишет боту -> сообщение приходит в группу админов,
-// админ отвечает реплаем -> ответ уходит курьеру.
+// Бот поддержки курьеров.
+// Курьер пишет боту -> в группе админов для него создаётся ОТДЕЛЬНАЯ ТЕМА (личный чат),
+// туда падает вся его переписка. Админ пишет в эту тему -> сообщение уходит курьеру.
+// Сообщения в теме, начинающиеся с "!", — внутренние заметки, курьеру не отправляются.
+// Если в группе не включены темы — работает по-старому (реплай на сообщение с #id).
 // Переменные окружения: BOT_TOKEN, ADMIN_CHAT_ID (id группы, узнать командой /chatid в группе).
 
 const TOKEN = Bun.env.BOT_TOKEN ?? "";
-const ADMIN_CHAT_ID = (Bun.env.ADMIN_CHAT_ID ?? "").trim();
+let ADMIN_CHAT_ID = (Bun.env.ADMIN_CHAT_ID ?? "").trim();
 const DOMAIN = Bun.env.RAILWAY_PUBLIC_DOMAIN ?? Bun.env.RENDER_EXTERNAL_HOSTNAME ?? "";
 const SECRET = TOKEN.replace(/[^A-Za-z0-9]/g, "").slice(-40) || "no-token";
 const API = `https://api.telegram.org/bot${TOKEN}/`;
+const STATE_FILE = "topics.json";
 
 async function tg(method: string, body: Record<string, unknown>): Promise<any> {
   try {
@@ -16,7 +20,14 @@ async function tg(method: string, body: Record<string, unknown>): Promise<any> {
       body: JSON.stringify(body),
     });
     const json: any = await res.json();
-    if (!json.ok) console.error(`[tg] ${method} failed:`, json.description);
+    if (!json.ok) {
+      console.error(`[tg] ${method} failed:`, json.description);
+      const mig = json.parameters?.migrate_to_chat_id;
+      if (mig && String(body.chat_id) === ADMIN_CHAT_ID) {
+        console.log("группа стала супергруппой, новый id:", mig);
+        ADMIN_CHAT_ID = String(mig);
+      }
+    }
     return json;
   } catch (e) {
     console.error(`[tg] ${method} error:`, e);
@@ -24,10 +35,13 @@ async function tg(method: string, body: Record<string, unknown>): Promise<any> {
   }
 }
 
+function fullName(from: any): string {
+  return [from.first_name, from.last_name].filter(Boolean).join(" ") || "Без имени";
+}
+
 function header(from: any): string {
-  const name = [from.first_name, from.last_name].filter(Boolean).join(" ") || "Без имени";
   const user = from.username ? ` (@${from.username})` : "";
-  return `👤 ${name}${user}\n🆔 #id${from.id}`;
+  return `👤 ${fullName(from)}${user}\n🆔 #id${from.id}`;
 }
 
 const CAPTION_TYPES = ["photo", "video", "document", "audio", "voice", "animation"];
@@ -47,6 +61,98 @@ const offHoursNotified = new Map<number, number>();
 function isOffHours(): boolean {
   const mskHour = (new Date().getUTCHours() + 3) % 24; // МСК = UTC+3
   return mskHour >= 22 || mskHour < 9;
+}
+
+// ---------- темы: courier id <-> id темы ----------
+let isForum = false;
+const userToThread = new Map<number, number>();
+const threadToUser = new Map<number, number>();
+let stateMsgId: number | null = null;
+
+async function loadState() {
+  if (!ADMIN_CHAT_ID) return;
+  const chat = await tg("getChat", { chat_id: ADMIN_CHAT_ID });
+  isForum = !!chat.result?.is_forum;
+  const pinned = chat.result?.pinned_message;
+  if (pinned?.document?.file_name === STATE_FILE) {
+    stateMsgId = pinned.message_id;
+    const f = await tg("getFile", { file_id: pinned.document.file_id });
+    if (f.ok) {
+      const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.result.file_path}`);
+      const data: Record<string, number> = await res.json().catch(() => ({}));
+      for (const [u, t] of Object.entries(data)) {
+        userToThread.set(Number(u), t);
+        threadToUser.set(t, Number(u));
+      }
+    }
+  }
+  console.log(`темы: ${isForum ? "включены" : "выключены"}, загружено курьеров: ${userToThread.size}`);
+}
+
+let saving = Promise.resolve();
+function saveState() {
+  saving = saving.then(async () => {
+    const data = Object.fromEntries(userToThread);
+    const form = new FormData();
+    form.append("chat_id", ADMIN_CHAT_ID);
+    form.append("disable_notification", "true");
+    form.append("caption", "🗂 Служебный файл бота (список тем курьеров). Не удалять и не откреплять.");
+    form.append("document", new Blob([JSON.stringify(data)], { type: "application/json" }), STATE_FILE);
+    const r: any = await fetch(API + "sendDocument", { method: "POST", body: form }).then((x) => x.json()).catch(() => null);
+    if (!r?.ok) return console.error("не удалось сохранить темы", r?.description);
+    await tg("pinChatMessage", { chat_id: ADMIN_CHAT_ID, message_id: r.result.message_id, disable_notification: true });
+    if (stateMsgId) await tg("deleteMessage", { chat_id: ADMIN_CHAT_ID, message_id: stateMsgId });
+    stateMsgId = r.result.message_id;
+  });
+  return saving;
+}
+
+const creating = new Map<number, Promise<number | null>>();
+async function getThread(from: any, forceNew = false): Promise<number | null> {
+  if (!forceNew && userToThread.has(from.id)) return userToThread.get(from.id)!;
+  if (creating.has(from.id)) return creating.get(from.id)!;
+  const p = (async () => {
+    const name = `${fullName(from)} · ${from.id}`.slice(0, 128);
+    const r = await tg("createForumTopic", { chat_id: ADMIN_CHAT_ID, name });
+    if (!r.ok) return null;
+    const tid = r.result.message_thread_id;
+    const old = userToThread.get(from.id);
+    if (old) threadToUser.delete(old);
+    userToThread.set(from.id, tid);
+    threadToUser.set(tid, from.id);
+    await tg("sendMessage", {
+      chat_id: ADMIN_CHAT_ID,
+      message_thread_id: tid,
+      text:
+        `🆕 Курьер написал в поддержку\n${header(from)}\n\n` +
+        `Всё, что вы напишете в этой теме, уйдёт курьеру.\n` +
+        `Начните сообщение с «!», чтобы оставить заметку только для своих.`,
+    });
+    await saveState();
+    return tid;
+  })();
+  creating.set(from.id, p);
+  try {
+    return await p;
+  } finally {
+    creating.delete(from.id);
+  }
+}
+
+// отправка в группу: в тему курьера (если темы включены) или по-старому
+async function toAdmin(from: any, send: (extra: Record<string, unknown>, withHeader: boolean) => Promise<any>) {
+  if (isForum) {
+    let tid = await getThread(from);
+    if (tid) {
+      let r = await send({ message_thread_id: tid }, false);
+      if (!r.ok && /thread|topic/i.test(r.description ?? "")) {
+        tid = await getThread(from, true); // тему удалили — создаём заново
+        if (tid) r = await send({ message_thread_id: tid }, false);
+      }
+      return r;
+    }
+  }
+  return send({}, true);
 }
 
 async function handleCourier(msg: any) {
@@ -73,10 +179,14 @@ async function handleCourier(msg: any) {
 
   if (msg.contact) {
     const own = msg.contact.user_id === from.id;
-    await tg("sendMessage", {
-      chat_id: ADMIN_CHAT_ID,
-      text: `📱 Курьер отправил номер${own ? "" : " (чужой контакт!)"}\n${header(from)}\nТелефон: +${String(msg.contact.phone_number).replace(/^\+/, "")}`,
-    });
+    const phone = `+${String(msg.contact.phone_number).replace(/^\+/, "")}`;
+    await toAdmin(from, (extra, withHeader) =>
+      tg("sendMessage", {
+        chat_id: ADMIN_CHAT_ID,
+        ...extra,
+        text: `📱 Курьер отправил номер${own ? "" : " (чужой контакт!)"}: ${phone}${withHeader ? "\n" + header(from) : ""}`,
+      }),
+    );
     await tg("sendMessage", {
       chat_id: chatId,
       text: "Спасибо, номер получили ✅ Теперь опиши свою проблему.",
@@ -85,30 +195,25 @@ async function handleCourier(msg: any) {
     return;
   }
 
-  const head = header(from);
-  let sent: any;
-
-  if (msg.text) {
-    const full = `${head}\n\n${msg.text}`;
-    if (full.length <= 4096) {
-      sent = await tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: full });
-    } else {
-      await tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: head });
-      sent = await tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: `#id${from.id}\n\n${msg.text}`.slice(0, 4096) });
+  const sent = await toAdmin(from, async (extra, withHeader) => {
+    const head = withHeader ? header(from) : "";
+    if (msg.text) {
+      const text = withHeader ? `${head}\n\n${msg.text}` : msg.text;
+      return tg("sendMessage", { chat_id: ADMIN_CHAT_ID, ...extra, text: text.slice(0, 4096) });
     }
-  } else if (CAPTION_TYPES.some((t) => msg[t])) {
-    const caption = `${head}${msg.caption ? "\n\n" + msg.caption : ""}`.slice(0, 1024);
-    sent = await tg("copyMessage", {
-      chat_id: ADMIN_CHAT_ID,
-      from_chat_id: chatId,
-      message_id: msg.message_id,
-      caption,
-    });
-  } else {
-    // стикеры, кружки, геолокация и т.п. — сначала шапка, потом само сообщение
-    await tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: head });
-    sent = await tg("copyMessage", { chat_id: ADMIN_CHAT_ID, from_chat_id: chatId, message_id: msg.message_id });
-  }
+    if (CAPTION_TYPES.some((t) => msg[t])) {
+      const caption = withHeader ? `${head}${msg.caption ? "\n\n" + msg.caption : ""}` : msg.caption ?? "";
+      return tg("copyMessage", {
+        chat_id: ADMIN_CHAT_ID,
+        ...extra,
+        from_chat_id: chatId,
+        message_id: msg.message_id,
+        caption: caption.slice(0, 1024),
+      });
+    }
+    if (withHeader) await tg("sendMessage", { chat_id: ADMIN_CHAT_ID, text: head });
+    return tg("copyMessage", { chat_id: ADMIN_CHAT_ID, ...extra, from_chat_id: chatId, message_id: msg.message_id });
+  });
 
   if (sent?.ok) {
     await tg("setMessageReaction", {
@@ -128,22 +233,7 @@ async function handleCourier(msg: any) {
   }
 }
 
-async function handleAdmin(msg: any) {
-  const reply = msg.reply_to_message;
-  if (!reply) return;
-  const src = `${reply.text ?? ""}\n${reply.caption ?? ""}`;
-  const m = src.match(/#id(\d+)/);
-  if (!m) {
-    if (reply.from?.is_bot) {
-      await tg("sendMessage", {
-        chat_id: msg.chat.id,
-        reply_to_message_id: msg.message_id,
-        text: "Не понял, кому отвечать. Отвечай реплаем на сообщение, где есть #id курьера.",
-      });
-    }
-    return;
-  }
-  const userId = Number(m[1]);
+async function deliver(msg: any, userId: number) {
   const res = await tg("copyMessage", { chat_id: userId, from_chat_id: msg.chat.id, message_id: msg.message_id });
   if (res.ok) {
     await tg("setMessageReaction", {
@@ -154,10 +244,54 @@ async function handleAdmin(msg: any) {
   } else {
     await tg("sendMessage", {
       chat_id: msg.chat.id,
+      ...(msg.message_thread_id ? { message_thread_id: msg.message_thread_id } : {}),
       reply_to_message_id: msg.message_id,
       text: `❌ Не доставлено курьеру: ${res.description ?? "ошибка"}`,
     });
   }
+}
+
+async function handleAdmin(msg: any) {
+  if (msg.from?.is_bot) return;
+  if (msg.forum_topic_created || msg.forum_topic_edited || msg.forum_topic_closed || msg.forum_topic_reopened) return;
+  if (msg.pinned_message || msg.new_chat_members || msg.left_chat_member) return;
+
+  // сообщение внутри темы курьера
+  if (msg.is_topic_message && msg.message_thread_id) {
+    const tid = msg.message_thread_id;
+    let userId = threadToUser.get(tid);
+    if (!userId) {
+      const topicName = msg.reply_to_message?.forum_topic_created?.name ?? "";
+      const m = topicName.match(/·\s*(\d+)\s*$/);
+      if (m) {
+        userId = Number(m[1]);
+        threadToUser.set(tid, userId);
+        userToThread.set(userId, tid);
+      }
+    }
+    if (!userId) return; // обычная тема, не курьерская
+    const text = msg.text ?? msg.caption ?? "";
+    if (text.startsWith("!") || text.startsWith("/")) return; // заметка для своих / команда
+    await deliver(msg, userId);
+    return;
+  }
+
+  // старый режим: реплай на сообщение с #id
+  const reply = msg.reply_to_message;
+  if (!reply) return;
+  const src = `${reply.text ?? ""}\n${reply.caption ?? ""}`;
+  const m = src.match(/#id(\d+)/);
+  if (!m) {
+    if (reply.from?.is_bot && !reply.document) {
+      await tg("sendMessage", {
+        chat_id: msg.chat.id,
+        reply_to_message_id: msg.message_id,
+        text: "Не понял, кому отвечать. Отвечай реплаем на сообщение, где есть #id курьера.",
+      });
+    }
+    return;
+  }
+  await deliver(msg, Number(m[1]));
 }
 
 async function handleUpdate(update: any) {
@@ -165,13 +299,27 @@ async function handleUpdate(update: any) {
   if (!msg || !msg.chat) return;
 
   if (msg.text && /^\/chatid(@\w+)?$/.test(msg.text.trim())) {
-    await tg("sendMessage", { chat_id: msg.chat.id, text: `ID этого чата: ${msg.chat.id}` });
+    await tg("sendMessage", {
+      chat_id: msg.chat.id,
+      ...(msg.message_thread_id ? { message_thread_id: msg.message_thread_id } : {}),
+      text: `ID этого чата: ${msg.chat.id}`,
+    });
     return;
   }
 
   if (msg.chat.type === "private") {
     await handleCourier(msg);
   } else if (ADMIN_CHAT_ID && String(msg.chat.id) === ADMIN_CHAT_ID) {
+    if (msg.forum_topic_created === undefined && !isForum && msg.is_topic_message) isForum = true;
+    if (msg.text && /^\/refresh(@\w+)?$/.test(msg.text.trim())) {
+      await loadState();
+      await tg("sendMessage", {
+        chat_id: msg.chat.id,
+        ...(msg.message_thread_id ? { message_thread_id: msg.message_thread_id } : {}),
+        text: `Темы: ${isForum ? "включены ✅" : "выключены ❌"}. Курьеров с темами: ${userToThread.size}`,
+      });
+      return;
+    }
     await handleAdmin(msg);
   }
 }
@@ -184,6 +332,7 @@ if (TOKEN && DOMAIN) {
   });
   console.log("setWebhook:", r.ok ? "ok" : r.description);
   await tg("setMyCommands", { commands: [{ command: "start", description: "Написать в поддержку" }] });
+  await loadState();
 } else {
   console.log("BOT_TOKEN или домен не заданы — вебхук не установлен");
 }
