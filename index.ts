@@ -53,6 +53,10 @@ const WELCOME =
   "Можно прикрепить скриншот или фото.\n\n" +
   "Ответ придёт сюда же, в этот чат.";
 
+const ASK_FIO =
+  "✍️ Чтобы написать в поддержку, сначала отправь своё ФИО полностью одним сообщением.\n" +
+  "Например: Иванов Иван Иванович";
+
 const OFF_HOURS_TEXT =
   "🌙 Поддержка работает с 9:00 до 22:00 по МСК.\n" +
   "Твоё сообщение мы получили и ответим утром.";
@@ -68,7 +72,6 @@ let isForum = false;
 const userToThread = new Map<number, number>();
 const threadToUser = new Map<number, number>();
 const userFio = new Map<number, string>(); // ФИО курьера (из его сообщений)
-const askedFio = new Set<number>();
 let stateMsgId: number | null = null;
 
 async function loadState() {
@@ -132,8 +135,10 @@ function extractFio(text: string, lenient = false): string | null {
   if (m && (lenient || m[1].split(" ").length >= 2)) return m[1];
   if (lenient) {
     const all = t.split(/[\s,.]+/).filter(Boolean);
+    const STOP = /^(не|пришл|оплат|деньг|привет|здравств|добр|день|вечер|утр|задан|сгорел|помог|помощ|вопрос|проблем|почему|когда|где|как|что|хочу|нужн|смен|заказ|курьер|алло|ау|ок|да|нет|спасибо|скажите|подскаж)/i;
     const words = all.filter((x) => /^[А-ЯЁа-яё-]{2,}$/.test(x));
-    if (all.length <= 3 && words.length >= 2 && words.length === all.length) return words.map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+    if (all.length >= 2 && all.length <= 4 && words.length === all.length && !words.some((w) => STOP.test(w)))
+      return words.map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" ");
   }
   return null;
 }
@@ -166,7 +171,7 @@ async function getThread(from: any, forceNew = false): Promise<number | null> {
       chat_id: ADMIN_CHAT_ID,
       message_thread_id: tid,
       text:
-        `🆕 Курьер написал в поддержку\n${header(from)}\n\n` +
+        `🆕 Курьер написал в поддержку\n${userFio.has(from.id) ? `📋 ФИО: ${userFio.get(from.id)}\n` : ""}${header(from)}\n\n` +
         `Всё, что вы напишете в этой теме, уйдёт курьеру.\n` +
         `Начните сообщение с «!», чтобы оставить заметку только для своих.`,
     });
@@ -211,11 +216,17 @@ async function handleCourier(msg: any) {
         one_time_keyboard: true,
       },
     });
+    if (!userFio.has(from.id)) await tg("sendMessage", { chat_id: chatId, text: ASK_FIO });
     return;
   }
 
   if (!ADMIN_CHAT_ID) {
     await tg("sendMessage", { chat_id: chatId, text: "Бот ещё настраивается, напиши чуть позже 🙏" });
+    return;
+  }
+
+  if (msg.contact && !userFio.has(from.id)) {
+    await tg("sendMessage", { chat_id: chatId, text: ASK_FIO });
     return;
   }
 
@@ -237,10 +248,31 @@ async function handleCourier(msg: any) {
     return;
   }
 
-  // если ФИО есть уже в первом сообщении — сразу называем тему по нему
-  if (isForum && !userFio.has(from.id) && !userToThread.has(from.id)) {
-    const fio = extractFio(msg.text ?? msg.caption ?? "");
-    if (fio) userFio.set(from.id, fio);
+  // без ФИО в поддержку не пускаем
+  if (!userFio.has(from.id)) {
+    const fio = extractFio(msg.text ?? msg.caption ?? "", true);
+    if (!fio) {
+      await tg("sendMessage", { chat_id: chatId, text: ASK_FIO });
+      return;
+    }
+    if (userToThread.has(from.id)) await setFio(from.id, fio); // старая тема — переименуем
+    else userFio.set(from.id, fio); // новая тема сразу создастся с ФИО
+    const name = fio.split(" ")[1] || fio;
+    const src = (msg.text ?? msg.caption ?? "").toLowerCase();
+    const rest = fio.toLowerCase().split(" ").reduce((a, w) => a.replace(w, ""), src).replace(/[^а-яёa-z0-9]/gi, "");
+    const onlyFio = !msg.photo && !msg.document && !msg.video && !msg.voice && rest.length < 4;
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: onlyFio
+        ? `Спасибо, ${name}! ✅ Теперь опиши свою проблему — можно прикрепить скриншот или фото.`
+        : `Спасибо, ${name}! ✅ Сообщение передали в поддержку.`,
+      reply_markup: { remove_keyboard: true },
+    });
+    if (onlyFio && !userToThread.has(from.id) && isForum) {
+      await getThread(from); // создаём тему сразу, само ФИО не пересылаем
+      return;
+    }
+    if (onlyFio) return;
   }
 
   const sent = await toAdmin(from, async (extra, withHeader) => {
@@ -269,19 +301,6 @@ async function handleCourier(msg: any) {
       message_id: msg.message_id,
       reaction: [{ type: "emoji", emoji: "👍" }],
     });
-    if (isForum && !userFio.has(from.id)) {
-      const fio = extractFio(msg.text ?? msg.caption ?? "", askedFio.has(from.id));
-      if (fio) {
-        askedFio.delete(from.id);
-        await setFio(from.id, fio);
-      } else if (!askedFio.has(from.id)) {
-        askedFio.add(from.id);
-        await tg("sendMessage", {
-          chat_id: chatId,
-          text: "Напиши, пожалуйста, своё ФИО полностью одним сообщением (например: Иванов Иван Иванович) 🙏",
-        });
-      }
-    }
     if (isOffHours()) {
       const last = offHoursNotified.get(from.id) ?? 0;
       if (Date.now() - last > 3 * 60 * 60 * 1000) {
