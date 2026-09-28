@@ -67,6 +67,8 @@ function isOffHours(): boolean {
 let isForum = false;
 const userToThread = new Map<number, number>();
 const threadToUser = new Map<number, number>();
+const userFio = new Map<number, string>(); // ФИО курьера (из его сообщений)
+const askedFio = new Set<number>();
 let stateMsgId: number | null = null;
 
 async function loadState() {
@@ -79,10 +81,12 @@ async function loadState() {
     const f = await tg("getFile", { file_id: pinned.document.file_id });
     if (f.ok) {
       const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.result.file_path}`);
-      const data: Record<string, number> = await res.json().catch(() => ({}));
-      for (const [u, t] of Object.entries(data)) {
+      const data: Record<string, any> = await res.json().catch(() => ({}));
+      for (const [u, v] of Object.entries(data)) {
+        const t = typeof v === "number" ? v : v.t;
         userToThread.set(Number(u), t);
         threadToUser.set(t, Number(u));
+        if (v?.n) userFio.set(Number(u), v.n);
       }
     }
   }
@@ -92,7 +96,8 @@ async function loadState() {
 let saving = Promise.resolve();
 function saveState() {
   saving = saving.then(async () => {
-    const data = Object.fromEntries(userToThread);
+    const data: Record<string, any> = {};
+    for (const [u, t] of userToThread) data[u] = userFio.has(u) ? { t, n: userFio.get(u) } : t;
     const form = new FormData();
     form.append("chat_id", ADMIN_CHAT_ID);
     form.append("disable_notification", "true");
@@ -107,12 +112,49 @@ function saveState() {
   return saving;
 }
 
+function topicName(from: any): string {
+  return `${userFio.get(from.id) ?? fullName(from)} · ${from.id}`.slice(0, 128);
+}
+
+// ищем ФИО в тексте: «Иванов Иван Иванович», «ФИО: Иванов Иван» и т.п.
+const W = "[А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?";
+function extractFio(text: string, lenient = false): string | null {
+  if (!text) return null;
+  const t = text.replace(/ё/g, "ё").replace(/\s+/g, " ").trim();
+  // Фамилия Имя Отчество (отчество на -вич/-вна/-ична/-оглы/-кызы) — в любом месте
+  let m = t.match(new RegExp(`(${W}) (${W}) (${W}(?:вич|вна|ична|инична|оглы|кызы))(?![а-яё])`));
+  if (m) return `${m[1]} ${m[2]} ${m[3]}`;
+  // «ФИО: Иванов Иван ...»
+  m = t.match(new RegExp(`ФИО\\s*[:\\-–]?\\s*(${W}(?: ${W}){1,2})`, "i"));
+  if (m) return m[1];
+  // начало сообщения: два-три слова с заглавной
+  m = t.match(new RegExp(`^(${W}(?: ${W}){1,2})(?=$|[\\s,.;:!?\\d])`));
+  if (m && (lenient || m[1].split(" ").length >= 2)) return m[1];
+  if (lenient) {
+    const all = t.split(/[\s,.]+/).filter(Boolean);
+    const words = all.filter((x) => /^[А-ЯЁа-яё-]{2,}$/.test(x));
+    if (all.length <= 3 && words.length >= 2 && words.length === all.length) return words.map((w) => w[0].toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+  }
+  return null;
+}
+
+async function setFio(userId: number, fio: string) {
+  if (userFio.get(userId) === fio) return;
+  userFio.set(userId, fio);
+  const tid = userToThread.get(userId);
+  if (tid) {
+    await tg("editForumTopic", { chat_id: ADMIN_CHAT_ID, message_thread_id: tid, name: `${fio} · ${userId}`.slice(0, 128) });
+    await tg("sendMessage", { chat_id: ADMIN_CHAT_ID, message_thread_id: tid, text: `✏️ Тема переименована: ${fio}` });
+  }
+  await saveState();
+}
+
 const creating = new Map<number, Promise<number | null>>();
 async function getThread(from: any, forceNew = false): Promise<number | null> {
   if (!forceNew && userToThread.has(from.id)) return userToThread.get(from.id)!;
   if (creating.has(from.id)) return creating.get(from.id)!;
   const p = (async () => {
-    const name = `${fullName(from)} · ${from.id}`.slice(0, 128);
+    const name = topicName(from);
     const r = await tg("createForumTopic", { chat_id: ADMIN_CHAT_ID, name });
     if (!r.ok) return null;
     const tid = r.result.message_thread_id;
@@ -195,6 +237,12 @@ async function handleCourier(msg: any) {
     return;
   }
 
+  // если ФИО есть уже в первом сообщении — сразу называем тему по нему
+  if (isForum && !userFio.has(from.id) && !userToThread.has(from.id)) {
+    const fio = extractFio(msg.text ?? msg.caption ?? "");
+    if (fio) userFio.set(from.id, fio);
+  }
+
   const sent = await toAdmin(from, async (extra, withHeader) => {
     const head = withHeader ? header(from) : "";
     if (msg.text) {
@@ -221,6 +269,19 @@ async function handleCourier(msg: any) {
       message_id: msg.message_id,
       reaction: [{ type: "emoji", emoji: "👍" }],
     });
+    if (isForum && !userFio.has(from.id)) {
+      const fio = extractFio(msg.text ?? msg.caption ?? "", askedFio.has(from.id));
+      if (fio) {
+        askedFio.delete(from.id);
+        await setFio(from.id, fio);
+      } else if (!askedFio.has(from.id)) {
+        askedFio.add(from.id);
+        await tg("sendMessage", {
+          chat_id: chatId,
+          text: "Напиши, пожалуйста, своё ФИО полностью одним сообщением (например: Иванов Иван Иванович) 🙏",
+        });
+      }
+    }
     if (isOffHours()) {
       const last = offHoursNotified.get(from.id) ?? 0;
       if (Date.now() - last > 3 * 60 * 60 * 1000) {
@@ -271,6 +332,11 @@ async function handleAdmin(msg: any) {
     }
     if (!userId) return; // обычная тема, не курьерская
     const text = msg.text ?? msg.caption ?? "";
+    const fioCmd = text.match(/^\/fio(?:@\w+)?\s+(.+)$/i);
+    if (fioCmd) {
+      await setFio(userId, fioCmd[1].trim().replace(/\s+/g, " "));
+      return;
+    }
     if (text.startsWith("!") || text.startsWith("/")) return; // заметка для своих / команда
     await deliver(msg, userId);
     return;
