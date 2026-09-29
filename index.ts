@@ -597,7 +597,8 @@ Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/remind") {
-      if (!REMIND_KEY || url.searchParams.get("key") !== REMIND_KEY) return new Response("forbidden", { status: 403 });
+      // ключ не обязателен: чаще чем раз в ~3 часа напоминание всё равно не уйдёт
+      if (REMIND_KEY && url.searchParams.get("key") !== REMIND_KEY) return new Response("forbidden", { status: 403 });
       return new Response(await maybeRemind());
     }
     if (req.method === "POST" && url.pathname === "/tg") {
