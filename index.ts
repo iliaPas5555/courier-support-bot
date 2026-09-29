@@ -73,6 +73,15 @@ const userToThread = new Map<number, number>();
 const threadToUser = new Map<number, number>();
 const userFio = new Map<number, string>(); // ФИО курьера (из его сообщений)
 let stateMsgId: number | null = null;
+// обращения: c — последнее сообщение курьера, a — последний ответ поддержки, d — закрыто, s — последние сообщения курьера
+type Info = { c: number; a: number; d: boolean; s: string[] };
+const info = new Map<number, Info>();
+let lastRemind = 0;
+function getInfo(uid: number): Info {
+  let i = info.get(uid);
+  if (!i) info.set(uid, (i = { c: 0, a: 0, d: true, s: [] }));
+  return i;
+}
 
 async function loadState() {
   if (!ADMIN_CHAT_ID) return;
@@ -86,10 +95,14 @@ async function loadState() {
       const res = await fetch(`https://api.telegram.org/file/bot${TOKEN}/${f.result.file_path}`);
       const data: Record<string, any> = await res.json().catch(() => ({}));
       for (const [u, v] of Object.entries(data)) {
+        if (u === "_r") { lastRemind = Number(v) || 0; continue; }
         const t = typeof v === "number" ? v : v.t;
-        userToThread.set(Number(u), t);
-        threadToUser.set(t, Number(u));
+        if (t) {
+          userToThread.set(Number(u), t);
+          threadToUser.set(t, Number(u));
+        }
         if (v?.n) userFio.set(Number(u), v.n);
+        if (v && typeof v === "object" && "c" in v) info.set(Number(u), { c: v.c || 0, a: v.a || 0, d: !!v.d, s: v.s || [] });
       }
     }
   }
@@ -99,13 +112,32 @@ async function loadState() {
 let saving = Promise.resolve();
 function saveState() {
   saving = saving.then(async () => {
-    const data: Record<string, any> = {};
-    for (const [u, t] of userToThread) data[u] = userFio.has(u) ? { t, n: userFio.get(u) } : t;
+    const data: Record<string, any> = { _r: lastRemind };
+    const ids = new Set<number>([...userToThread.keys(), ...info.keys()]);
+    for (const u of ids) {
+      const t = userToThread.get(u);
+      const i = info.get(u);
+      if (!i && !userFio.has(u)) { data[u] = t; continue; }
+      data[u] = { t, n: userFio.get(u), ...(i ? { c: i.c, a: i.a, d: i.d, s: i.s } : {}) };
+    }
+    const blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+    const caption = "🗂 Служебный файл бота (темы и обращения курьеров). Не удалять и не откреплять.";
+    if (stateMsgId) {
+      // обновляем тот же закреплённый файл, чтобы не спамить группу
+      const ef = new FormData();
+      ef.append("chat_id", ADMIN_CHAT_ID);
+      ef.append("message_id", String(stateMsgId));
+      ef.append("media", JSON.stringify({ type: "document", media: "attach://state", caption }));
+      ef.append("state", blob, STATE_FILE);
+      const er: any = await fetch(API + "editMessageMedia", { method: "POST", body: ef }).then((x) => x.json()).catch(() => null);
+      if (er?.ok || /not modified/i.test(er?.description ?? "")) return;
+      console.error("editMessageMedia:", er?.description);
+    }
     const form = new FormData();
     form.append("chat_id", ADMIN_CHAT_ID);
     form.append("disable_notification", "true");
-    form.append("caption", "🗂 Служебный файл бота (список тем курьеров). Не удалять и не откреплять.");
-    form.append("document", new Blob([JSON.stringify(data)], { type: "application/json" }), STATE_FILE);
+    form.append("caption", caption);
+    form.append("document", blob, STATE_FILE);
     const r: any = await fetch(API + "sendDocument", { method: "POST", body: form }).then((x) => x.json()).catch(() => null);
     if (!r?.ok) return console.error("не удалось сохранить темы", r?.description);
     await tg("pinChatMessage", { chat_id: ADMIN_CHAT_ID, message_id: r.result.message_id, disable_notification: true });
@@ -113,6 +145,28 @@ function saveState() {
     stateMsgId = r.result.message_id;
   });
   return saving;
+}
+
+let saveTimer: any = null;
+function saveStateSoon() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveState();
+  }, 4000);
+}
+
+function noteCourier(uid: number, msg: any) {
+  const i = getInfo(uid);
+  i.c = Date.now();
+  i.d = false;
+  const tag = msg.photo ? "[фото] " : msg.document ? "[файл] " : msg.voice ? "[голосовое] " : msg.video ? "[видео] " : "";
+  const txt = (tag + (msg.text ?? msg.caption ?? "")).replace(/\s+/g, " ").trim();
+  if (txt) {
+    i.s.push(txt.slice(0, 200));
+    if (i.s.length > 5) i.s.shift();
+  }
+  saveStateSoon();
 }
 
 function topicName(from: any): string {
@@ -296,6 +350,7 @@ async function handleCourier(msg: any) {
   });
 
   if (sent?.ok) {
+    noteCourier(from.id, msg);
     await tg("setMessageReaction", {
       chat_id: chatId,
       message_id: msg.message_id,
@@ -316,6 +371,9 @@ async function handleCourier(msg: any) {
 async function deliver(msg: any, userId: number) {
   const res = await tg("copyMessage", { chat_id: userId, from_chat_id: msg.chat.id, message_id: msg.message_id });
   if (res.ok) {
+    const inf = getInfo(userId);
+    inf.a = Date.now();
+    saveStateSoon();
     await tg("setMessageReaction", {
       chat_id: msg.chat.id,
       message_id: msg.message_id,
@@ -351,6 +409,14 @@ async function handleAdmin(msg: any) {
     }
     if (!userId) return; // обычная тема, не курьерская
     const text = msg.text ?? msg.caption ?? "";
+    if (/^(\/done(@\w+)?|решено|закрыто|✅)$/i.test(text.trim())) {
+      const inf = getInfo(userId);
+      inf.d = true;
+      inf.s = [];
+      saveStateSoon();
+      await tg("sendMessage", { chat_id: msg.chat.id, message_thread_id: tid, text: "✅ Обращение закрыто — убрал из напоминаний. Если курьер напишет снова, оно откроется само." });
+      return;
+    }
     const fioCmd = text.match(/^\/fio(?:@\w+)?\s+(.+)$/i);
     if (fioCmd) {
       await setFio(userId, fioCmd[1].trim().replace(/\s+/g, " "));
@@ -379,6 +445,99 @@ async function handleAdmin(msg: any) {
   await deliver(msg, Number(m[1]));
 }
 
+// ---------- напоминания о нерешённых обращениях ----------
+const REMIND_EVERY = 3 * 60 * 60 * 1000;
+const REMIND_KEY = (Bun.env.REMIND_KEY ?? "").trim();
+const esc = (x: string) => x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+function category(t: string): string {
+  const s = t.toLowerCase();
+  if (/оплат|деньг|не приш|выплат|перевод|зарплат|сумм|недоплат|реестр/.test(s)) return "💸 Оплата";
+  if (/сгор|задани|отклик|принять|приня/.test(s)) return "📋 Задание";
+  if (/кабинет|\bлк\b|вход|парол|код|приложени|войти|аккаунт|самозанят|инн/.test(s)) return "🔐 Личный кабинет";
+  if (/штраф|удерж/.test(s)) return "⚠️ Штраф";
+  if (/смен|график|выход|вахт|заказ|доставк/.test(s)) return "🗓 Работа/смены";
+  return "💬 Вопрос";
+}
+
+function ago(ms: number): string {
+  const m = Math.max(1, Math.round(ms / 60000));
+  if (m < 60) return `${m} мин`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h} ч ${m % 60} мин`;
+  return `${Math.floor(h / 24)} дн`;
+}
+
+function topicLink(uid: number): string | null {
+  const tid = userToThread.get(uid);
+  if (!tid || !ADMIN_CHAT_ID.startsWith("-100")) return null;
+  return `https://t.me/c/${ADMIN_CHAT_ID.slice(4)}/${tid}`;
+}
+
+function describe(uid: number, i: Info, n: number, now: number, waiting: boolean): string {
+  const name = esc(userFio.get(uid) ?? `ID ${uid}`);
+  const all = i.s.join(" · ");
+  const short = all.length > 160 ? all.slice(0, 157) + "…" : all;
+  const link = topicLink(uid);
+  const head = link ? `<a href="${link}">${name}</a>` : name;
+  const when = waiting ? `ждёт ответа ${ago(now - i.c)}` : `ответили ${ago(now - i.a)} назад, не закрыто`;
+  return `${n}. <b>${head}</b> — ${when}\n   ${category(all)}${short ? `: «${esc(short)}»` : ""}`;
+}
+
+async function sendReminder(force = false, threadId?: number): Promise<boolean> {
+  if (!ADMIN_CHAT_ID) return false;
+  const now = Date.now();
+  const waiting: [number, Info][] = [];
+  const open: [number, Info][] = [];
+  for (const [uid, i] of info) {
+    if (i.d || !i.c) continue;
+    (i.c > i.a ? waiting : open).push([uid, i]);
+  }
+  const extra = threadId ? { message_thread_id: threadId } : {};
+  if (!waiting.length && !open.length) {
+    if (force) await tg("sendMessage", { chat_id: ADMIN_CHAT_ID, ...extra, text: "✅ Нерешённых обращений нет." });
+    return false;
+  }
+  waiting.sort((a, b) => a[1].c - b[1].c);
+  open.sort((a, b) => a[1].a - b[1].a);
+  const parts: string[] = [`⏰ <b>Нерешённые обращения: ${waiting.length + open.length}</b>`];
+  if (waiting.length) {
+    parts.push(`\n🔴 <b>Ждут ответа (${waiting.length}):</b>`);
+    waiting.forEach(([u, i], k) => parts.push(describe(u, i, k + 1, now, true)));
+  }
+  if (open.length) {
+    parts.push(`\n🟡 <b>Ответили, но не закрыто (${open.length}):</b>`);
+    open.forEach(([u, i], k) => parts.push(describe(u, i, k + 1, now, false)));
+  }
+  parts.push(`\nЧтобы закрыть обращение, напиши в теме курьера «решено» или /done. Список в любой момент — /tasks.`);
+  // режем на сообщения до 4000 символов
+  let buf = "";
+  const chunks: string[] = [];
+  for (const p of parts) {
+    if ((buf + "\n" + p).length > 3900) { chunks.push(buf); buf = ""; }
+    buf = buf ? buf + "\n" + p : p;
+  }
+  if (buf) chunks.push(buf);
+  for (const c of chunks) await tg("sendMessage", { chat_id: ADMIN_CHAT_ID, ...extra, text: c, parse_mode: "HTML", disable_web_page_preview: true });
+  return true;
+}
+
+let reminding = false;
+async function maybeRemind(): Promise<string> {
+  if (reminding) return "busy";
+  const now = Date.now();
+  if (now - lastRemind < REMIND_EVERY - 15 * 60 * 1000) return "too early";
+  reminding = true;
+  try {
+    lastRemind = now;
+    const sentAny = await sendReminder(false);
+    saveStateSoon();
+    return sentAny ? "sent" : "nothing to remind";
+  } finally {
+    reminding = false;
+  }
+}
+
 async function handleUpdate(update: any) {
   const msg = update.message;
   if (!msg || !msg.chat) return;
@@ -396,6 +555,10 @@ async function handleUpdate(update: any) {
     await handleCourier(msg);
   } else if (ADMIN_CHAT_ID && String(msg.chat.id) === ADMIN_CHAT_ID) {
     if (msg.forum_topic_created === undefined && !isForum && msg.is_topic_message) isForum = true;
+    if (msg.text && /^\/tasks(@\w+)?$/.test(msg.text.trim())) {
+      await sendReminder(true, msg.message_thread_id);
+      return;
+    }
     if (msg.text && /^\/refresh(@\w+)?$/.test(msg.text.trim())) {
       await loadState();
       await tg("sendMessage", {
@@ -417,6 +580,13 @@ if (TOKEN && DOMAIN) {
   });
   console.log("setWebhook:", r.ok ? "ok" : r.description);
   await tg("setMyCommands", { commands: [{ command: "start", description: "Написать в поддержку" }] });
+  await tg("setMyCommands", {
+    scope: { type: "all_group_chats" },
+    commands: [
+      { command: "tasks", description: "Нерешённые обращения" },
+      { command: "done", description: "Закрыть обращение (в теме курьера)" },
+    ],
+  });
   await loadState();
 } else {
   console.log("BOT_TOKEN или домен не заданы — вебхук не установлен");
@@ -426,6 +596,10 @@ Bun.serve({
   port: Number(Bun.env.PORT ?? 3000),
   async fetch(req) {
     const url = new URL(req.url);
+    if (url.pathname === "/remind") {
+      if (!REMIND_KEY || url.searchParams.get("key") !== REMIND_KEY) return new Response("forbidden", { status: 403 });
+      return new Response(await maybeRemind());
+    }
     if (req.method === "POST" && url.pathname === "/tg") {
       if (req.headers.get("x-telegram-bot-api-secret-token") !== SECRET) {
         return new Response("forbidden", { status: 403 });
@@ -443,5 +617,10 @@ Bun.serve({
     return new Response(TOKEN ? "courier support bot is running" : "BOT_TOKEN is not set");
   },
 });
+
+// пока сервер не спит — проверяем сами; внешний пинг раз в 3 часа будит его на Render
+setInterval(() => {
+  maybeRemind().catch((e) => console.error("remind error:", e));
+}, 10 * 60 * 1000);
 
 console.log("server started");
