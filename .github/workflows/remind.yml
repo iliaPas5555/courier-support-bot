@@ -1,0 +1,15 @@
+name: remind
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Разбудить бота и отправить напоминание
+        run: |
+          for i in 1 2 3; do
+            curl -fsS --max-time 90 https://courier-support-bot.onrender.com/remind && break
+            sleep 20
+          done
