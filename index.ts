@@ -67,6 +67,172 @@ function isOffHours(): boolean {
   return mskHour >= 22 || mskHour < 9;
 }
 
+// ---------- смена номера телефона (пишет в Google-таблицу «сводка» через Apps Script) ----------
+const SHEETS_URL = (Bun.env.SHEETS_URL ??
+  "https://script.google.com/macros/s/AKfycbxlAkIQOtFWTX7_Q9Y-xYDnGWrLKgfvlZ1VeGbYuNNq3rE_FjzXmTi_evgQjDPivFax/exec").trim();
+let sheetsSecret = (Bun.env.SHEETS_SECRET ?? "").trim(); // если пусто — бот сам привяжется (pair) и сохранит секрет в topics.json
+const PHONE_BTN = "🔄 Изменить номер телефона";
+const CANCEL_BTN = "Отмена";
+type PhoneFlow = { step: "old" | "new"; old?: string; names?: string[] };
+const phoneFlow = new Map<number, PhoneFlow>();
+
+function normPhone(s: unknown): string | null {
+  let d = String(s ?? "").replace(/\D/g, "");
+  if (d.length === 11 && d[0] === "8") d = "7" + d.slice(1);
+  if (d.length === 10) d = "7" + d;
+  return /^7\d{10}$/.test(d) ? d : null;
+}
+
+async function sheets(action: string, data: Record<string, unknown>): Promise<any> {
+  if (!SHEETS_URL) return { ok: false, error: "SHEETS_URL не задан" };
+  const call = async (body: Record<string, unknown>) => {
+    try {
+      const r = await fetch(SHEETS_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        redirect: "follow",
+      });
+      return await r.json().catch(() => ({ ok: false, error: `bad response ${r.status}` }));
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  };
+  if (!sheetsSecret) {
+    const p = await call({ action: "pair" });
+    if (p.ok && p.secret) {
+      sheetsSecret = p.secret;
+      saveStateSoon();
+      console.log("Apps Script: бот привязан");
+    } else return { ok: false, error: "не удалось привязаться к таблице: " + (p.error ?? "") };
+  }
+  return call({ ...data, action, secret: sheetsSecret });
+}
+
+const mainKeyboard = {
+  keyboard: [[{ text: PHONE_BTN }]],
+  resize_keyboard: true,
+  is_persistent: true,
+};
+
+async function startPhoneFlow(chatId: number, uid: number) {
+  if (!userFio.has(uid)) {
+    await tg("sendMessage", { chat_id: chatId, text: ASK_FIO + "\n\nПосле этого снова нажми «" + PHONE_BTN + "»." });
+    return;
+  }
+  phoneFlow.set(uid, { step: "old" });
+  await tg("sendMessage", {
+    chat_id: chatId,
+    text: "📱 Смена номера телефона.\n\nНапиши СТАРЫЙ номер — тот, который сейчас указан у тебя для выплат.\nНапример: 79001234567",
+    reply_markup: { keyboard: [[{ text: CANCEL_BTN }]], resize_keyboard: true },
+  });
+}
+
+// возвращает true, если сообщение обработано сценарием смены номера
+async function phoneStep(msg: any, flow: PhoneFlow): Promise<boolean> {
+  const chatId = msg.chat.id;
+  const from = msg.from;
+  const text = String(msg.text ?? "").trim();
+  if (text === CANCEL_BTN || /^\/cancel/.test(text)) {
+    phoneFlow.delete(from.id);
+    await tg("sendMessage", { chat_id: chatId, text: "Ок, отменили. Если нужно — напиши свой вопрос.", reply_markup: mainKeyboard });
+    return true;
+  }
+  const raw = msg.contact ? msg.contact.phone_number : text;
+  const p = normPhone(raw);
+  if (!p) {
+    if (!text && !msg.contact) return false; // фото/файл — пусть уходит в поддержку как обычно
+    await tg("sendMessage", { chat_id: chatId, text: "Не похоже на номер 🤔 Напиши 11 цифр, например 79001234567. Или нажми «Отмена»." });
+    return true;
+  }
+  const fio = userFio.get(from.id) ?? "";
+
+  if (flow.step === "old") {
+    const f = await sheets("findPhone", { phone: p, fio });
+    if (!f.ok) {
+      phoneFlow.delete(from.id);
+      await tg("sendMessage", { chat_id: chatId, text: "Не получилось проверить номер, попробуй позже или напиши в поддержку 🙏", reply_markup: mainKeyboard });
+      console.error("findPhone:", f.error);
+      return true;
+    }
+    if (!f.found) {
+      phoneFlow.delete(from.id);
+      await tg("sendMessage", {
+        chat_id: chatId,
+        text: `Не нашли номер ${p} у «${fio}» в таблице выплат 🤷\nПроверь, что номер и ФИО указаны верно, или напиши в поддержку — разберёмся вручную.`,
+        reply_markup: mainKeyboard,
+      });
+      await toAdmin(from, (extra, withHeader) =>
+        tg("sendMessage", {
+          chat_id: ADMIN_CHAT_ID, ...extra,
+          text: `📱 Курьер хотел сменить номер, но старый номер ${p} не найден у «${fio}» в сводке.${withHeader ? "\n" + header(from) : ""}`,
+        }),
+      );
+      return true;
+    }
+    phoneFlow.set(from.id, { step: "new", old: p, names: f.names });
+    await tg("sendMessage", {
+      chat_id: chatId,
+      text: `✅ Нашли: ${(f.names ?? []).join(", ")} — ${p}.\n\nТеперь напиши НОВЫЙ номер, на который нужно получать выплаты.`,
+      reply_markup: { keyboard: [[{ text: CANCEL_BTN }]], resize_keyboard: true },
+    });
+    return true;
+  }
+
+  // step new
+  const old = flow.old!;
+  if (p === old) {
+    await tg("sendMessage", { chat_id: chatId, text: "Это тот же самый номер 🙂 Напиши новый или нажми «Отмена»." });
+    return true;
+  }
+  phoneFlow.delete(from.id);
+  const r = await sheets("changePhone", { oldPhone: old, newPhone: p, fio, tg: from.id, by: "бот (курьер)" });
+  if (!r.ok) {
+    await tg("sendMessage", { chat_id: chatId, text: "Не получилось поменять номер автоматически — передали в поддержку, поменяем вручную 🙏", reply_markup: mainKeyboard });
+    await toAdmin(from, (extra, withHeader) =>
+      tg("sendMessage", {
+        chat_id: ADMIN_CHAT_ID, ...extra,
+        text: `⚠️ Ошибка смены номера ${old} → ${p} (${fio}): ${r.error}${withHeader ? "\n" + header(from) : ""}`,
+      }),
+    );
+    return true;
+  }
+  await tg("sendMessage", {
+    chat_id: chatId,
+    text: `✅ Готово! Номер для выплат изменён: ${old} → ${p}.\nСледующие выплаты пойдут на новый номер.`,
+    reply_markup: mainKeyboard,
+  });
+  await toAdmin(from, (extra, withHeader) =>
+    tg("sendMessage", {
+      chat_id: ADMIN_CHAT_ID, ...extra,
+      text: `📱 Курьер сменил номер в сводке: ${old} → ${p}\n${(r.names ?? []).join(", ")} (ячеек: ${r.n})${withHeader ? "\n" + header(from) : ""}`,
+      reply_markup: { inline_keyboard: [[{ text: "↩️ Отменить смену", callback_data: `pu:${from.id}:${old}:${p}` }]] },
+    }),
+  );
+  return true;
+}
+
+async function handleCallback(cq: any) {
+  const data: string = cq.data ?? "";
+  const chat = cq.message?.chat;
+  const m = data.match(/^pu:(\d+):(7\d{10}):(7\d{10})$/);
+  if (!m || !chat || String(chat.id) !== ADMIN_CHAT_ID) {
+    await tg("answerCallbackQuery", { callback_query_id: cq.id });
+    return;
+  }
+  const [, uid, old, neu] = m;
+  const r = await sheets("changePhone", { oldPhone: neu, newPhone: old, fio: userFio.get(Number(uid)) ?? "", tg: uid, by: "отмена: " + fullName(cq.from) });
+  await tg("answerCallbackQuery", { callback_query_id: cq.id, text: r.ok ? "Вернул старый номер" : "Ошибка: " + r.error, show_alert: !r.ok });
+  if (r.ok) {
+    await tg("editMessageText", {
+      chat_id: chat.id,
+      message_id: cq.message.message_id,
+      text: `${cq.message.text}\n\n↩️ Отменено (${fullName(cq.from)}): вернули ${old}`,
+    });
+    await tg("sendMessage", { chat_id: Number(uid), text: `ℹ️ Поддержка отменила смену номера. Для выплат снова указан ${old}. Если это ошибка — напиши сюда.` });
+  }
+}
+
 // ---------- темы: courier id <-> id темы ----------
 let isForum = false;
 const userToThread = new Map<number, number>();
@@ -96,6 +262,7 @@ async function loadState() {
       const data: Record<string, any> = await res.json().catch(() => ({}));
       for (const [u, v] of Object.entries(data)) {
         if (u === "_r") { lastRemind = Number(v) || 0; continue; }
+        if (u === "_s") { if (!sheetsSecret && typeof v === "string") sheetsSecret = v; continue; }
         const t = typeof v === "number" ? v : v.t;
         if (t) {
           userToThread.set(Number(u), t);
@@ -113,6 +280,7 @@ let saving = Promise.resolve();
 function saveState() {
   saving = saving.then(async () => {
     const data: Record<string, any> = { _r: lastRemind };
+    if (sheetsSecret && !Bun.env.SHEETS_SECRET) data._s = sheetsSecret;
     const ids = new Set<number>([...userToThread.keys(), ...info.keys()]);
     for (const u of ids) {
       const t = userToThread.get(u);
@@ -264,15 +432,18 @@ async function handleCourier(msg: any) {
     await tg("sendMessage", {
       chat_id: chatId,
       text: WELCOME,
-      reply_markup: {
-        keyboard: [[{ text: "📱 Отправить номер телефона", request_contact: true }]],
-        resize_keyboard: true,
-        one_time_keyboard: true,
-      },
+      reply_markup: mainKeyboard,
     });
     if (!userFio.has(from.id)) await tg("sendMessage", { chat_id: chatId, text: ASK_FIO });
     return;
   }
+
+  if (msg.text && (msg.text.trim() === PHONE_BTN || /^\/phone(@\w+)?$/.test(msg.text.trim()))) {
+    await startPhoneFlow(chatId, from.id);
+    return;
+  }
+  const flow = phoneFlow.get(from.id);
+  if (flow && (await phoneStep(msg, flow))) return;
 
   if (!ADMIN_CHAT_ID) {
     await tg("sendMessage", { chat_id: chatId, text: "Бот ещё настраивается, напиши чуть позже 🙏" });
@@ -320,7 +491,7 @@ async function handleCourier(msg: any) {
       text: onlyFio
         ? `Спасибо, ${name}! ✅ Теперь опиши свою проблему — можно прикрепить скриншот или фото.`
         : `Спасибо, ${name}! ✅ Сообщение передали в поддержку.`,
-      reply_markup: { remove_keyboard: true },
+      reply_markup: mainKeyboard,
     });
     if (onlyFio && !userToThread.has(from.id) && isForum) {
       await getThread(from); // создаём тему сразу, само ФИО не пересылаем
@@ -539,6 +710,10 @@ async function maybeRemind(): Promise<string> {
 }
 
 async function handleUpdate(update: any) {
+  if (update.callback_query) {
+    await handleCallback(update.callback_query);
+    return;
+  }
   const msg = update.message;
   if (!msg || !msg.chat) return;
 
@@ -576,10 +751,15 @@ if (TOKEN && DOMAIN) {
   const r = await tg("setWebhook", {
     url: `https://${DOMAIN}/tg`,
     secret_token: SECRET,
-    allowed_updates: ["message"],
+    allowed_updates: ["message", "callback_query"],
   });
   console.log("setWebhook:", r.ok ? "ok" : r.description);
-  await tg("setMyCommands", { commands: [{ command: "start", description: "Написать в поддержку" }] });
+  await tg("setMyCommands", {
+    commands: [
+      { command: "start", description: "Написать в поддержку" },
+      { command: "phone", description: "Изменить номер телефона для выплат" },
+    ],
+  });
   await tg("setMyCommands", {
     scope: { type: "all_group_chats" },
     commands: [
